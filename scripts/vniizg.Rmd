@@ -1,0 +1,1631 @@
+
+```{r}
+theme_set(theme_bw())
+```
+
+
+#Work with raw reads
+
+##Metadata 
+
+```{r}
+#Add the metadata to the r
+metadata <- sample_data(read.csv(file = 'meta3.csv',
+                                        dec = ",",
+                                        header = TRUE,
+                                        row.names = 1 ))
+
+#Choose the parametre which needed to be use 
+param <- "" #Put the param here!!!
+```
+
+##dada
+###Processing of raw reeds
+```{r}
+#Write the path to the directory
+path <- "../16s_norm/" 
+list.files(path)
+```
+
+```{r}
+#Take filenames
+fnFs <- sort(list.files(path, pattern="R1.fastq", full.names = TRUE)) 
+fnRs <- sort(list.files(path, pattern="R2.fastq", full.names = TRUE))
+
+sample.names <- sapply(strsplit(basename(fnFs), "__"), `[`, 1)
+
+#Plot sequence quality
+quality_f <- plotQualityProfile(fnFs[1:290])  
+quality_r <- plotQualityProfile(fnRs[1:290])
+
+ggsave("quality_f3.pdf", quality_f, width = 50, height = 50,limitsize = FALSE)
+ggsave("quality_r3.pdf", quality_r, width = 50, height = 50,limitsize = FALSE)
+
+```
+
+```{r}
+#Make files for forward filtering
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fq.gz"))
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+#Filter and trim reads
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, maxN=0, truncLen=130 , compress=TRUE, multithread=TRUE)
+
+?filterAndTrim
+#Print the results
+out
+
+#Plot sequence quality
+quality_f2 <- plotQualityProfile(filtFs[1:290])  
+quality_r2 <- plotQualityProfile(filtRs[1:290])
+
+ggsave("quality_f_7.pdf", quality_f2, width = 50, height = 50,limitsize = FALSE)
+ggsave("quality_r_7.pdf", quality_r2, width = 50, height = 50,limitsize = FALSE)
+```
+
+```{r}
+#Learn errors of sequensing 
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+# #plot error profile
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+# 
+#dereplication (analogue of unique.seqs in mothur)
+
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+ 
+#name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+```
+
+```{r}
+#Merge files by the id?
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE, minOverlap=9)
+
+#Construct sequence table
+seqtab <- makeSequenceTable(mergers)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+#Account for the abundances of those variants
+sum(seqtab.nochim)/sum(seqtab)
+
+#Track reads through the pipeline
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+#Columns for tracking
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+```{r}
+#Save csv and RDS
+write.csv(seqtab.nochim,"seqtab.nochim.csv", row.names = FALSE)
+
+
+saveRDS(seqtab.nochim, "seqtab.rds") 
+#Read RDS if need to
+seqtab.nochim <- readRDS("seqtab.rds")
+```
+
+###Taxa assign
+```{r}
+#Taxa assign
+taxa <- assignTaxonomy(seqtab.nochim, "/Users/aleksandrakozlova/Desktop/Work/Kurchatnik/database/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "/Users/aleksandrakozlova/Desktop/Work/Kurchatnik/database/silva_species_assignment_v138.1.fa")
+
+#Removing sequence rownames for display only
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+#Print head of assigned taxa
+head(taxa.print)
+
+
+```
+
+###Making phylogenetic tree
+```{r}
+#Copy seqtab
+seqs <- getSequences(seqtab)
+# This propagates to the tip labels of the tree
+names(seqs) <- seqs 
+#Making tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA)
+
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phang.align)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phang.align)
+
+## negative edges length changed to 0!
+
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                      rearrangement = "stochastic", control = pml.control(trace = 0))
+
+```
+
+##phyloseq
+
+```{r}
+#Making first phyloseq object
+ps.Silva <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+                     tax_table(taxa))
+
+#Take DNA from first phyloseq object
+dna <- Biostrings::DNAStringSet(taxa_names(ps.Silva))
+names(dna) <- taxa_names(ps.Silva)
+
+#Add dna to phyloseq
+ps.Silva <- merge_phyloseq(ps.Silva, dna)
+taxa_names(ps.Silva) <- sprintf("ASV_%04d", seq(ntaxa(ps.Silva)))
+
+
+#Saving first phyloseq to RDS with tree and seqs
+saveRDS(stages, "stages.rds")
+stages <- readRDS("stages.rds")
+```
+
+```{r}
+#Save everything
+write.csv(count_mtrx, file = "count_mtrx.csv")
+write.csv(t(ps.Silva@otu_table), file = "dada2.Silva.otutab.csv")
+writeXStringSet(ps.Silva@refseq, filepath = "genera.norm.fasta",  format="fasta")
+write.csv(readcount.table, file = "dada2.Silva.sumtab.csv")
+
+#Open everything
+otu <- otu_table(as.matrix(read.csv(file = "dada2.Silva.otutab.csv", row.names = 1)), taxa_are_rows = TRUE)
+tax <- tax_table(as.matrix(read.csv(file = "dada2.Silva.taxtab.csv", row.names = 1)))
+seq <- readDNAStringSet(file = "genera.norm.fasta", format = "fasta")
+
+#Making phyloseq
+fin.phy.tree <- phyloseq(otu, tax, seq, sample.metadata)
+fin.phy.tree <- fin.phy.tree %>% subset_taxa(Family!= "Mitochondria" | is.na(Family) & Class!="Chloroplast" | is.na(Class) & Order!="Chloroplast" | is.na(Order))
+
+mergedGP <- mergedGP %>% subset_taxa(Kingdom != "Animal" | is.na(Kingdom))
+
+tax_table(mergedGP)
+
+#Save RDS with new phyloseq
+saveRDS(kracken_ph1, "kracken_ph1.rds")
+fin.phy.tree <- readRDS("fin_phy_tree.rds")
+fin.phy <- merge_phyloseq(fin.phy.tree, metadata)
+saveRDS(kracken, "kracken_all.rds")
+
+```
+
+filtering data for removing zeros 
+```{r}
+
+ps_obj1 = subset_samples(ps_obj1, round.sample_sums.ps_obj1..sample_sums.ps.rarefied2....100.
+ > 75)
+newPhyloObject = subset_samples(newPhyloObject, sample_names(newPhyloObject) != 
+                                  "ARRIAH.16S_V4.23.repl2.R1.fastq.gz")
+df
+stages <- subset_samples(newPhyloObject, stagen != "day 37")
+
+otu <- otu_table(newPhyloObject)
+tax <- tax_table(newPhyloObject)
+new <- phyloseq(otu,tax,metadata)
+
+a <- data.frame(sample_names(newPhyloObject))
+sample_data(fin.phy.tree)
+ps_filterd2 <- subset_samples(ps2, stage2 == "first" | stage2 == "second" | stage2 ==  "third")
+
+set.seed(111) # keep result reproductive
+ps.rarefied = rarefy_even_depth(fin.phy, rngseed=1, sample.size=7000, replace=F)
+?rarefy_even_depth
+ps.rarefied2 = rarefy_even_depth(data, rngseed=1, sample.size=100000, replace=F)
+
+
+samplenames2 <- data.frame(sample_names(fin.phy.tree))
+
+ps.rarefied.meta <- merge_phyloseq(ps.rarefied, metadata)
+saveRDS(ps.rarefied.meta, "ps.rarefiedall8k.meta.rds")
+ps.rarefied.meta <- readRDS("ps.rarefiedall8k.meta.rds")
+
+```
+
+
+##microeco object preparing
+
+```{r}
+# make meco database and drop mitochondria with chloroplast from there
+meco_dataset <- phyloseq2meco(kracken)
+meco_dataset$filter_pollution(taxa = c("mitochondria", "chloroplast", "Homo", "Animal", "Plant", "Protist"))
+
+#calculate abundance
+meco_dataset$cal_abund()
+class(meco_dataset$taxa_abund)
+meco_dataset$taxa_abund$Phylum[1:30, 1:30]
+
+#calculate a diversity
+meco_dataset$cal_alphadiv(PD = FALSE)
+class(meco_dataset$alpha_diversity)
+
+#calculate beta diversity
+meco_dataset$cal_betadiv(unifrac = F)
+class(meco_dataset$beta_diversity)
+meco_dataset$cal_betadiv()
+```
+
+```{r}
+df0 <- sample_names(fin.phy.tree)
+df1 <- sample_data(stages)
+
+df3 <- cbind(df0,df1)
+
+
+df3 <- df3 %>% 
+  rename(
+    eco_con = df0,
+    rat = df1
+    )
+df1$stage2 <- df1$stage
+df1$stage2 <- gsub("1", "first", df1$stage2)
+df1$stage2 <- gsub("2", "first", df1$stage2)
+df1$stage2 <- gsub("3", "first", df1$stage2)
+
+
+df1$stage2 <- gsub("4", "second", df1$stage2)
+df1$stage2 <- gsub("5", "second", df1$stage2)
+df1$stage2 <- gsub("6", "second", df1$stage2)
+
+df1$stage2 <- gsub("7", "second", df1$stage2)
+
+df1$stage2 <- gsub("8", "third", df1$stage2)
+df1$stage2 <- gsub("9", "third", df1$stage2)
+df1$stage2 <- gsub("10", "third", df1$stage2)
+
+
+
+df3$eco_con <- gsub(".K_.*", "", df3$eco_con)
+
+df3$rat <- gsub("control.K_", "", df3$rat)
+df3$rat <- gsub("ecolact.E_", "", df3$rat)
+
+rownames(df3) <- df1
+
+meta1 <- sample_data(df1)
+ps1 = merge_phyloseq(newPhyloObject, metadata)
+ps2 = merge_phyloseq(stages, meta1)
+tax_table(stages)
+sample_data(stages)
+```
+
+
+#Making different normalisations
+
+#Analysis
+
+##Count of reads per sample
+```{r}
+tax_glom_fin.phy <- tax_glom(stages, "G")
+df <- data.frame(sample_sums(data))
+
+boxplot(df$sample_sums.data.,
+main = "Mean reads in samples",
+xlab = "Sum of reads per sample",
+ylab = "Reads",
+col = "#0096C7",
+border = "#026E9E",
+horizontal = TRUE,
+notch = TRUE, size = 25) 
+
+mean(df$sample_sums.newPhyloObject.)
+sum(df$sample_sums.fin.phy.tree.)
+```
+
+##Rarefaction curve
+
+```{r}
+tab <- otu_table(ps_obj1)
+class(tab) <- "matrix" # as.matrix() will do nothing
+## you get a warning here, but this is what we need to have
+tab <- t(tab) # transpose observations to rows
+library(vegan)
+rare <- rarecurve(tab, step=100, lwd=0.5, ylab="ASV",  label=F)
+p <- ggrare(data, color="study_name", step = 10, se = FALSE)
+p <- p + facet_wrap(~stage2)
+p
+
+sample_data(data)
+sample_data(kracken_ph1)
+ggsave("rare_stage.svg", p, width = 20, height = 20)
+
+```
+
+
+```{r}
+meco_dataset$tidy_dataset()
+t1 <- trans_rarefy$new(meco_dataset, alphadiv = "Shannon", depth = c(0, 10, 50, 500, 20000, 300000, 500000, 1000000))
+t1$plot_rarefy(color_values = palette_1, color = "zar", show_point = T, add_fitting = T)
+t1$plot_rarefy( show_point = FALSE, add_fitting = TRUE)
+?microeco(plot_rarefy())
+```
+
+
+
+##Abundance analysis
+
+###Take ASVs for analysis
+```{r}
+df <- data.frame(1,round(sample_sums(ps_obj1)/sample_sums(ps.rarefied2)*100))
+
+df2 <- aggregate(df$X1, by=list(df$round.sample_sums.ps_obj1..sample_sums.ps.rarefied2....100.),FUN=sum)
+?aggregate
+
+remaining_count_reads <- ggplot(df2, aes(x=Group.1, y=x)) + 
+  geom_bar(stat = "identity", fill = "#0096C7") +
+  xlab("% remaining readings") + ylab("Number of samples") +
+  theme(axis.title = element_text(size = 25))
+
+
+ps_obj1 <- merge_phyloseq(ps_obj1,sample_data(df))
+```
+
+###Tables with abundance
+```{r}
+table_count_func <- function(data) {
+  levels <- c("Genus", "Family", "Order", "Class", "Phylum")
+  for (level in levels) {
+    tax_glom_fin.phy <- tax_glom(data, level)
+    print(level)
+    ps.prop <- transform_sample_counts(tax_glom_fin.phy, function(otu) otu/sum(otu))
+    readcount.table <- cbind(as.data.frame(ps.prop@refseq),ps.prop@otu_table,ps.prop@tax_table)
+    write.csv(readcount.table, file = paste("rel_",level,".csv"))
+  }
+}
+```
+
+```{r}
+table_count_func(newPhyloObject)
+```
+
+
+###Relative abundance
+
+```{r}
+t1 <- trans_abund$new(dataset = meco_dataset, taxrank = "Phylum", ntaxa = 30, groupmean = "stage3")
+g1 <- t1$plot_bar(others_color = "grey70", legend_text_italic = FALSE) + theme_classic() + theme(axis.title.y = element_text(size = 18))
+
+t2 <- trans_abund$new(dataset = dataset, taxrank = "Kingdom", ntaxa = 10)
+t1$plot_heatmap(xtext_keep = FALSE, withmargin = FALSE)
+?plot_heatmap
+
+?plot_bar
+?trans_abund
+
+t1 <- trans_abund$new(dataset = meco_dataset, taxrank = "Phylum", ntaxa = 15)
+t1$plot_box(group = "stage2", xtext_angle = 30)
+
+ggsave("Genus_kracken.png", g1, width = 10, height = 6)
+
+
+t1 <- trans_abund$new(dataset = meco_dataset, taxrank = "Kingdom", ntaxa = 4, groupmean = "stage3")
+t1$plot_radar(values.radar = c("0%", "70%", "100%"), grid.min = 0, grid.mid = 0.70, grid.max = 1)
+t1 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", ntaxa = 8, groupmean = "Type")
+t1$plot_radar(values.radar = c("0%", "25%", "50%"), grid.min = 0, grid.mid = 0.25, grid.max = 0.5)
+
+dataset1 <- meco_dataset$merge_samples(use_group = "stage")
+t1 <- trans_venn$new(dataset1)
+t1$plot_venn(petal_plot = TRUE, petal_color = RColorBrewer::brewer.pal(8, "Dark2"))
+t1$plot_venn(petal_plot = TRUE, petal_center_size = 50, petal_r = 1.5, petal_a = 3, petal_move_xy = 3.8, petal_color_center = "#BEBADA")
+```
+
+
+
+
+
+
+
+
+###Pheatmap
+
+For asvs
+```{r}
+tax_glom_fin.phy <- tax_glom(ps.rarefied2, "G")
+
+mergedGP = merge_samples(kracken_ph, "stage3")
+
+taxas1 <- core_members(ps.rarefied2, detection = 10, prevalence = 5/100)
+ps_obj1 <- prune_taxa(taxas1, ps.rarefied2)
+ps_obj1
+```
+
+```{r}
+df <- data.frame(sample_data(fin.phy.tree))
+df1 <- sample_data(cbind(df, df2))
+
+fin.phy.tree <- phyloseq(otu, tax, seq, df1)
+```
+
+
+Make two functions for make df from our phyloseq and connect data about taxa for our asv's.
+```{r}
+taxa_name_func <- function(x) {paste0(x['ASV'], ' ', x['F'],  '.g ' , gsub('/', ' ', gsub("-", "", x['G'])))}
+pmerare_count_table <- function (ps_obj, taxa_name_func) {
+  otu_matrix <- as(otu_table(ps_obj), 'matrix')
+  taxa_matrix <- as(tax_table(ps_obj), 'matrix')
+  taxa_matrix <- cbind(ASV=rownames(taxa_matrix), taxa_matrix)  
+  taxa_matrix_good_names <- apply(taxa_matrix, MARGIN=1, taxa_name_func)
+  rownames(otu_matrix) <- taxa_matrix_good_names
+  return(otu_matrix)
+}
+```
+
+
+```{r}
+taxa_name_func <- function(x) {paste0(x['ASV'], ' ', x['Kingdom'],  '.P ' , gsub('/', ' ', gsub("-", "", x['Phylum'])))}
+pmerare_count_table <- function (ps_obj, taxa_name_func) {
+  otu_matrix <- as(otu_table(mergedGP), 'matrix')
+  taxa_matrix <- as(tax_table(mergedGP), 'matrix')
+  taxa_matrix <- cbind(ASV=rownames(taxa_matrix), taxa_matrix)  
+  taxa_matrix_good_names <- apply(taxa_matrix, MARGIN=1, taxa_name_func)
+  colnames(otu_matrix) <- taxa_matrix_good_names
+  return(otu_matrix)
+}
+
+otu_matrix <- t(otu_matrix)
+```
+
+
+Make our function work and give some arguments. After that normalize our data with log or clr function.
+```{r}
+count_mtrx <- pmerare_count_table(mergedGP, taxa_name_func) #задаем то, что берется в функцию
+
+class(count_mtrx)
+ps2 <- microbiome::transform(otu_matrix, "clr")
+class(ps2)
+```
+
+
+```{r}
+count_mtrx_nw <- data.frame(count_mtrx)
+df <- count_mtrx_nw
+
+df <- df %>% mutate(
+  stage_0 = rowSums(.[grep("0.repl", names(.))], na.rm = TRUE),
+  stage_1 = rowSums(.[grep("1.repl", names(.))], na.rm = TRUE),
+  stage_2 = rowSums(.[grep("2.repl", names(.))], na.rm = TRUE),
+  stage_3 = rowSums(.[grep("3.repl", names(.))], na.rm = TRUE),
+  stage_4 = rowSums(.[grep("4.repl", names(.))], na.rm = TRUE),
+  stage_5 = rowSums(.[grep("5.repl", names(.))], na.rm = TRUE),
+  stage_6 = rowSums(.[grep("6.repl", names(.))], na.rm = TRUE),
+  stage_7 = rowSums(.[grep("7.repl", names(.))], na.rm = TRUE),
+  stage_8 = rowSums(.[grep("8.repl", names(.))], na.rm = TRUE),
+  stage_9 = rowSums(.[grep("9.repl", names(.))], na.rm = TRUE))
+
+df <- df %>% select(starts_with('stage_'))
+
+data <- data.matrix(df)
+
+
+```
+
+
+Function for saving pdf with pheatmap
+```{r}
+save_pheatmap <- function(x, filename, width=10, height=5) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   png(filename,width = width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+```
+
+####Drowing pheatmap
+
+Connect metadata with df (don't know how take the exist metadata ;(((( )
+```{r}
+metadata <- data.frame(sample_data(stages))
+readfile <- read.csv('metadata_flow.csv', header = TRUE)
+```
+
+After all modifications we can plot the pheatmap and ssave it.
+```{r}
+xx <- pheatmap::pheatmap(ps2, cellwidth = 5, cellheight = 2,
+         cluster_row = T,
+         cluster_cols = F,
+         show_rownames = T,
+         show_colnames = T,
+         fontsize_row = 2, 
+         fontsize_col = 4,
+         fontsize = 4,
+         angle_col = "315")
+
+class(xx)
+?pheatmap::pheatmap
+#, cluster_cols = FALSE)
+#, gaps_col = seq(2,82,by=2))
+ggsave("genus4.svg", xx, width = 5, height = 3)
+```
+
+Save pheatmap for the dirrectory  *Change names in save_pheatmap_pdf!!!*
+```{r}
+save_pheatmap(xx, "pheatmap_bracken_phylum.pdf")
+save_pheatmap_pdf(xx, "pheatmap_bracken_phylum.pdf")
+
+traceback()
+grid::grid.draw
+```
+
+###Microeco
+
+```{r}
+#Making lists for put plots there 
+plot_list_tax <- list()
+plot_list_tax_group <- list()
+plot_boxplot_tax <- list()
+
+#Write levels for cycle
+list_level <- c("Phylum", "Order", "Class", "Family", "Genus")
+
+#Cycle for plot abundance on different taxonomic level
+for(level in list_level) {
+  #Counting data for plotting
+  t1 <- trans_abund$new(dataset = meco_dataset, taxrank = level, ntaxa = 10)
+  plot_list_tax[[level]] <- t1$plot_bar(others_color = "grey70", xtext_keep = FALSE, legend_text_italic = FALSE, ytitle_size = 10, xtext_size=5)
+  #Barplot and boxplot
+  plot_boxplot_tax[[level]] <- t1$plot_box(group = param, ytitle_size = 10, xtext_size=5)
+  
+  #Counting data for plotting with group
+  t2 <- trans_abund$new(dataset = meco_dataset, taxrank = level, ntaxa = 10, groupmean = param) 
+  plot_list_tax_group[[level]] <- t2$plot_bar(others_color = "grey70", legend_text_italic = FALSE, ytitle_size = 10, xtext_size=5)
+}
+
+plot_col_taxas <- do.call(grid.arrange,c(plot_list_tax, top = "Column plot by group with sample showing", ncol=2) )
+plot_col_taxas_group <- do.call(grid.arrange,c(plot_list_tax_group , top = "Column plot by groups", ncol=2))
+plot_boxplot_tax <- do.call(grid.arrange,c(plot_boxplot_tax , top = "Boxplot taxa abundunce", ncol=2))
+```
+
+###Bubble plot
+
+```{r}
+#Write levels for cycle
+list_level <- c("Phylum", "Order", "Class", "Family", "Genus")
+
+#Cycle for plot abundance on different taxonomic level
+for(level in list_level) {
+  taxa_level <- tax_glom(fin.phy.tree, level)
+  bubble <- get_top_taxa(physeq_obj = taxa_level, n = 60, relative = TRUE,
+                       discard_other = FALSE, other_label = "Other")
+  bub_melt <- psmelt(bubble)
+  Bubble(bub_melt, level)
+  }
+```
+
+Function for plotting the bubble plot
+```{r}
+#Making bubble plot function
+Bubble <- function(x,level)
+  {ggplot(x, aes(x = Sample , y = level , size = Abundance)) +
+  geom_point(data = x %>% filter(Abundance >= 0.1),
+             shape = 21,
+             colour = "#000000",
+             fill = "olivedrab3" ,
+             stroke = 1,
+             alpha = 0.5) +
+  geom_point(data = x %>% filter(Abundance <0.1),
+             shape = 4,
+             size = 1,
+             stroke = 1,
+             colour = "#000000",
+             fill = "olivedrab3" ,
+             alpha = 0.5) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank()) +
+  scale_size_area(breaks = c(0, 2000, 4000, 6000, 8000, 10000), max_size = 15) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 0.5, hjust = 0.7, size = 8), 
+        axis.text.y = element_text(size = 10))
+labs(x = NULL, y = NULL,
+     size = "Abundance (%)")}
+
+#Function for save bubble plot
+save_Bubble_pdf <- function(x, filename, width = 5, height = 5) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+
+```
+
+###Differential abundance analysis
+
+```{r}
+t1 <- trans_diff$new(dataset = meco_dataset, method = "lefse", group = "stage2", alpha = 0.01, lefse_subgroup = NULL)
+# see t1$res_diff for the result
+# From v0.8.0, threshold is used for the LDA score selection.
+diff <- t1$plot_diff_bar(threshold = 4)
+# we show 20 taxa with the highest LDA (log10)
+diff <- t1$plot_diff_bar(use_number = 1:40, width = 0.8, color_values = palette_1,group_order = c("first", "second", "third"))
+
+ggsave("diff3.png", diff, width = 8, height = 5)
+
+```
+
+```{r}
+# pairwise comparison between gut and tongue
+ps.taxa.sub <- subset_samples(ps.taxa,  stage2 %in% c("first", "third"))
+# filter sparse features, with > 90% zeros
+ps.taxa.pse.sub <- prune_taxa(rowSums(otu_table(ps.taxa.sub) == 0) < ncol(otu_table(ps.taxa.sub)) * 0.9, ps.taxa.sub)
+ps_ds = phyloseq_to_deseq2(ps.taxa.pse.sub, ~ stage2)
+# use alternative estimator on a condition of "every gene contains a sample with a zero"
+ds <- estimateSizeFactors(ps_ds, type="poscounts")
+?estimateSizeFactors
+ds = DESeq(ds, test="Wald", fitType="parametric")
+alpha = 0.05 
+res = results(ds, alpha=alpha)
+res = res[order(res$padj, na.last=NA), ]
+taxa_sig = rownames(res[1:20, ]) # select bottom 20 with lowest p.adj values
+ps.taxa.rel <- transform_sample_counts(ps.rarefied, function(x) x/sum(x)*100)
+ps.taxa.rel.sig <- prune_taxa(taxa_sig, ps.taxa.rel)
+# Only keep gut and tongue samples
+ps.taxa.rel.sig <- prune_samples(colnames(otu_table(ps.taxa.pse.sub)), ps.taxa.rel.sig)
+```
+
+```{r}
+matrix <- as.matrix(data.frame(otu_table(ps.taxa.rel.sig)))
+rownames(matrix) <- as.character(tax_table(ps.taxa.rel.sig)[, "Species"])
+metadata_sub <- data.frame(sample_data(ps.taxa.rel.sig))
+# Define the annotation color for columns and rows
+annotation_col = data.frame(
+    Subject = as.factor(metadata_sub$animal), 
+    `stage` = as.factor(metadata_sub$stage2), 
+    check.names = FALSE
+)
+rownames(annotation_col) = rownames(metadata_sub)
+
+annotation_row = data.frame(
+    Phylum = as.factor(tax_table(ps.taxa.rel.sig)[, "Phylum"])
+)
+
+rownames(annotation_row) = rownames(matrix)
+
+# ann_color should be named vectors
+phylum_col = RColorBrewer::brewer.pal(length(levels(annotation_row$Phylum)), "Paired")
+names(phylum_col) = levels(annotation_row$Phylum)
+ann_colors = list(
+    Subject = c(`subject-1` = "red", `subject-2` = "blue"),
+    `Body site` = c(gut = "purple", tongue = "yellow"),
+    Phylum = phylum_col
+)
+
+ComplexHeatmap::pheatmap(matrix, scale= "row", 
+                         annotation_col = annotation_col, 
+                         annotation_row = annotation_row, 
+                         annotation_colors = ann_colors)
+
+```
+
+
+##Alpha_diversity
+
+###Hand count 
+
+```{r}
+palette_1 <- c("#B6CBDC","#BBDEFB","#90CAF9","#64B5F6","#42A5F5","#2196F3",
+                        "#1E88E5","#1976D2","#1565C0","#0D47A1","#093371","#162E51","#162E51")
+                        
+palette_2 <- c("#FF7B00","#FF8800","#FF9500","#FFA200","#FFAA00","#FFB700","#FFC300",
+                        "#FFD000","#FFDD00","#FFEA00","#FFF153","#FFFAC0")
+                        
+palette_3 <- c("#F94144", "#F3722C", "#F8961E", "#F9844A", "#F9C74F", "#90BE6D", "#43AA8B", "#4D908E", "#577590", "#277DA1")
+
+a_div<- estimate_richness(ps_obj1, measures = c("Observed", "InvSimpson", "Shannon", "Chao1", "Simpson"))
+
+a_div <- cbind(data.frame(sample_data(ps_obj1)),a_div)
+
+stage <- ggboxplot(a_div, x = "stage2", y = "Simpson",
+          color = "stage2",
+          add = "jitter", palette = palette_1, order = c("day 0", "day 4", "day 7", "day 11", "day 13", "day 18", "day 20", "day 22", "day 25","day 30","day 32","day 34","day 37")) + 
+  geom_hline(yintercept = mean(a_div$Simpson), linetype = 4)+ # Add horizontal line at base mean
+  stat_compare_means(method = "anova")+        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE) 
+
+ggboxplot(a_div, x = "animaln", y = "Shannon",
+          color = "animaln",legend = "none",
+          add = "jitter", palette = palette_2) + 
+  geom_hline(yintercept = mean(a_div$Shannon), linetype = 2)+ # Add horizontal line at base mean
+  stat_compare_means(method = "anova")+        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE) 
+
+ggsave("Simpson_kracken.png", stage, width = 8, height = 6)
+
+#, order = c("1", "2", "3", "4", "5", "6", "7", "8", "9","10")
+
+#, order = c("day 0", "day 4", "day 7", "day 11", "day 13", "day 18", "day 20", "day 22", "day 25")
+
+write.csv(a_div,file = "a_richness.csv")
+```
+
+###from hui
+
+```{r}
+
+a_div<- estimate_richness(ps2, measures = c("Observed", "InvSimpson", "Shannon", "Chao1", "Simpson"))
+a_div <- cbind(data.frame(sample_data(ps2)),a_div)
+
+ggboxplot(a_div, x = "stage2", y = "Simpson",
+          color = "stage2",legend = "none",
+          add = "jitter", palette = palette_1, order = c("first", "second", "third")) + 
+  geom_hline(yintercept = mean(a_div$Simpson), linetype = 4)+ # Add horizontal line at base mean
+  stat_compare_means(method = "anova")+        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE)
+
+plot_richness(ps.rarefied, x="stage2", measures=c("Observed", "Shannon")) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(strip.background = element_blank(), axis.text.x.bottom = element_text(angle = -90))
+```
+
+
+###Microeco
+
+```{r}
+a_div_list <- list()
+a_div <- function(micro) {
+  t1 <- trans_alpha$new(dataset = micro, group = param)
+  measures = c("Shannon","InvSimpson", "Observed")
+  methods = c("KW", "wilcox", "t.test")
+  for (method in methods) {
+    a_dives <- list()
+    for (measure in measures) {
+      t1$cal_diff(method = method)
+      a_dives[[measure]] <- t1$plot_alpha(measure = measure, order_x_mean = TRUE, main = method, ytitle_size = 6, xtext_size=6)
+    }
+    a_div_list[[method]] <- do.call(grid.arrange,c(a_dives, ncol=3))
+  }
+  a_div_plot <- do.call(grid.arrange,c(a_div_list , top = "A-diversity", ncol=1))
+  return(a_div_plot)
+}
+```
+
+
+```{r}
+df_aplha <- data.frame(sample_names(fin_ecolact),estimate_richness(fin_ecolact))
+meta1
+df_meta_aplha <- cbind(meta1,df_aplha)
+datatable_meta_aplha <- data.table(df_meta_aplha)
+is.data.table(datatable_meta_aplha)
+
+pairs <- dcast(datatable_meta_aplha, rat ~ eco_con, value.var = "sample_names.fin_ecolact.")
+
+pairs[, alpha_con := datatable_meta_aplha[datatable_meta_aplha$eco_con == Control]$Shannon, by = .(Control)]
+pairs[, alpha_eco := datatable_meta_aplha[datatable_meta_aplha$eco_con == Ecolact]$Shannon, by = .(Ecolact)]
+wilcox.test(pairs$alpha_con, pairs$alpha_eco, paired=T)
+
+
+ggplot(datatable_meta_aplha) + 
+  geom_boxplot(aes(type, Shannon,fill = type)) + 
+  theme_minimal() +xlab("") + 
+  theme(legend.position = 'none') + 
+  geom_point(aes(type, Shannon)) + 
+  geom_segment(data=pairs, 
+               x = rep(1, nrow(pairs)),
+               xend = rep(2, nrow(pairs)),
+               y = pairs$alpha_c, 
+               yend = pairs$alpha_milk,
+               linewidth =0.1)
+```
+
+
+```{r}
+param = "eco_con"
+
+a_siv <- a_div(meco_dataset)
+```
+
+
+
+
+
+##Betha_diversity
+
+###Vegan
+```{r}
+#Making phyloseq with needed normalization
+bat <- microbiome::transform(ps_obj1, "compositional")  #Change the argument
+newPhyloObject
+```
+
+Permutational analysis of variance
+```{r}
+#Count the distance between objects
+erie_bray <- phyloseq::distance(bat, method = "euclidean")
+#Make dataframe from sample data
+sampledf <- data.frame(sample_data(bat))
+
+#Count the homogeneous of variances (pv > 0.05 needed) 
+beta <- betadisper(erie_bray, sampledf$stage2) #Change the argument
+permutest(beta)
+
+#Count permanova (pv < 0.01 needed)
+permanova <- adonis2(erie_bray ~ stage2, data = sampledf) #Change the argument
+permanova
+```
+
+```{r}
+#Calculate the ordination 
+ord.nmds.bray <- ordinate(bat, method="PCoA", distance="euclidean") #Change the arguments (method and distance)
+
+#Plot ordination
+plot_ordination_phyloseq <- plot_ordination(bat, ord.nmds.bray, color='stage2', title="Euclidean PCoA",label="stage2") + stat_ellipse(geom = "polygon", type="norm", alpha=0.01, aes(fill=stage2))
+
+a <- as.matrix(vegdist(t(ps2), method="euclidean"))
+?vegdist
+bray_distance <- pheatmap(a, cellwidth = 9, cellheight = 9, col = hcl.colors(50), fontsize_row = 8, 
+         fontsize_col = 8)
+
+
+#Save the plot
+ggsave("dist.pdf", bray_distance, width = 15, height = 15)
+```
+
+###Microeco
+
+Only with relative abundance ?
+```{r}
+#Make new object with transformation data for beta diversity
+t10 <- trans_beta$new(dataset = meco_dataset, group = "stage2", measure = "bray") #Check the argument
+#Write the ordination method
+t10$cal_ordination(ordination = "PCoA")
+
+#Plot the ordination
+plot_bdev <- t10$plot_ordination(plot_color = "stage2", plot_type = c("point", "ellipse"), color_values = palette_1) + labs(title = "beta dev") #Check the arguments
+
+?plot_ordination
+#Save the plot
+ggsave("plot_bdev_mer.pdf", plot_bdev, width = 6, height = 5)
+```
+
+
+##Correlation analysis
+
+```{r}
+t1 <- trans_env$new(dataset = meco_dataset)
+```
+
+
+##Clusterisation
+
+```{r}
+tax_glom_fin.phy <- tax_glom(filter_data, "Genus" )
+no_zero <- subset_samples_no_zero(filter_data)
+
+taxas1 <- core_members(filter_data, detection = 1, prevalence = 10/100)
+ps_obj1 <- prune_taxa(taxas1, filter_data)
+
+count_mtrx <- pmerare_count_table(ps_obj1, taxa_name_func) #задаем то, что берется в функцию
+ps2 <- microbiome::transform(count_mtrx, "compositional")
+?microbiome::transform
+```
+
+```{r}
+a <- NbClust(data = ps2,  distance = "euclidean",
+        min.nc = 2, max.nc = 15, method = "kmeans")
+```
+
+
+#check count of reads
+
+```{r}
+tax_glom_fin.phy <- tax_glom(ecolact, "Genus")
+
+taxas1 <- core_members(ecolact, detection = 10/100, prevalence = 50/100)
+ps_obj1 <- prune_taxa(taxas1, ecolact)
+
+raw_counts_list <- cbind(as.data.frame(tax_glom_fin.phy@refseq),tax_glom_fin.phy@otu_table,tax_glom_fin.phy@tax_table)
+filtered_counts_list <- cbind(as.data.frame(ps_obj1@refseq),ps_obj1@otu_table,ps_obj1@tax_table)
+
+hist(rowSums(filtered_counts_list$Genus)/rowSums(raw_counts_list$Genus[rownames(filtered_counts_list$Genus),]), 
+     20, main = "",
+     xlab="доля оставшихся в анализе родов, %",
+     ylab="N образцов")
+hist(rowSums(filtered_counts_list$Order)/rowSums(raw_counts_list$Order[rownames(filtered_counts_list$Order),]), 20)
+
+min(rowSums(filtered_counts_list$genus))
+min(rowSums(filtered_counts_list$order))
+```
+
+\
+```{r}
+data.frame(sample_data(fin_ecolact))
+```
+
+
+
+
+
+#Анализ старых данных после кракена
+
+
+```{r}
+#выгружаем файлы и анализируем коровый состав микробиома
+bracken <- read.csv('Bracken-merge.csv', header = TRUE)
+bracken_avg <- select(bracken, name, LSDN_88_frac, LSDN_89_frac, LSDN_90_frac, SPV_91_frac, SPV_92_frac, SPV_93_frac, SPV_94_frac
+                      , SPV_95_frac, SPV_96_frac, SPV_97_frac, SPV_98_frac, SPV_99_frac, SPV_100_frac)
+bracken_abs <- select(bracken, name, LSDN_88_num, LSDN_89_num, LSDN_90_num, SPV_91_num, SPV_92_num, SPV_93_num, SPV_94_num
+                      , SPV_95_num, SPV_96_num, SPV_97_num, SPV_98_num, SPV_99_num, SPV_100_num)
+```
+
+
+```{r}
+ggvenn(
+  x, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+```
+
+
+```{r}
+filter(bracken_abs, hair_color == "none" | eye_color == "black")
+```
+
+```{r}
+filtered_counts_list <- lapply(raw_counts_list, function(r_counts){
+  raw_counts <- r_counts[meta$sample,
+                         !grepl("k__Bacteria;p__;", colnames(r_counts))]
+  
+  raw_counts <- raw_counts[rowSums(raw_counts) >= 2000,]
+  
+  in_use <- colSums(raw_counts>0) >= 0.5 * nrow(raw_counts)
+  raw_abund <- raw_counts*100/rowSums(raw_counts)
+  
+  high_abundant_but_rare <- colnames(raw_abund[!in_use])[apply(raw_abund[, !in_use],2 ,max) >10]
+  print(high_abundant_but_rare)
+  
+  filtered_counts <- raw_counts[, in_use]
+  filtered_counts <- cbind(raw_counts[, in_use], raw_counts[high_abundant_but_rare])
+  hist(rowSums(filtered_counts)/rowSums(raw_counts), 20)
+  short_names <- data.table(taxon = colnames(filtered_counts))
+  if (length(str_split(short_names$taxon[1], ";")[[1]]) != 7){
+    short_names[, short_name := make_nice_names(taxon)]
+  } else{
+    short_names[, short_name := rev(str_split(taxon, ";")[[1]])[1], by =.(taxon)]
+    short_names[,short_name := str_replace(short_name, "s__", ""), by =.(taxon)]
+    short_names[,short_name := str_replace_all(short_name, "[.]", " "), by =.(taxon)]
+  }
+  length(unique(short_names$short_name))
+  colnames(filtered_counts) <- short_names$short_name
+  filtered_counts
+})
+```
+
+
+
+
+
+
+```{r}
+palette_3 <- c("#8ECAE6", "#FFB703")
+alpha <- read.csv('alpha.csv', header = TRUE)
+?read.csv
+
+index <- ggboxplot(alpha, x = "Animal", y = "Simpson.s.Reciprocal.Index",
+          color = "Animal",legend = "none",
+          add = "jitter", palette = palette_3) + 
+  geom_hline(yintercept = mean(alpha$Simpson.s.Reciprocal.Index), linetype = 2)+ # Add horizontal line at base mean
+  stat_compare_means(method = "anova", label.y = 20)+        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE) + 
+  xlab("Animal") + ylab("Simpson's.Reciprocal Index ") +
+  theme(axis.title = element_text(size = 20))
+
+ggsave("simpson_rec.svg", index, width = 6, height = 4)
+
+
+
+```
+
+
+
+
+```{r}
+otu_bracken <- otu_table(as.matrix(read.csv(file = "otu_bracken.csv", row.names = 1)), taxa_are_rows = TRUE)
+tax_bracken <- tax_table(as.matrix(read.csv(file = "tax_bracken.csv", row.names = 1)))
+
+bracken_phylo <- phyloseq(otu, tax)
+
+```
+
+```{r}
+taxas1 <- core_members(bracken_phylo, detection = 5, prevalence = 8/100)
+ps_obj1 <- prune_taxa(taxas1, bracken_phylo)
+ps_obj1
+```
+
+
+```{r}
+taxa_name_func <- function(x) {paste0(x['Species'])}
+pmerare_count_table <- function (ps_obj, taxa_name_func) {
+  otu_matrix <- as(otu_table(ps_obj), 'matrix')
+  taxa_matrix <- as(tax_table(ps_obj), 'matrix')
+  taxa_matrix <- cbind(ASV=rownames(taxa_matrix), taxa_matrix)  
+  taxa_matrix_good_names <- apply(taxa_matrix, MARGIN=1, taxa_name_func)
+  rownames(otu_matrix) <- taxa_matrix_good_names
+  return(otu_matrix)
+}
+
+count_mtrx <- pmerare_count_table(ps_obj1, taxa_name_func) #задаем то, что берется в функцию
+ps2 <- microbiome::transform(count_mtrx, "clr")
+
+xx <- pheatmap(ps2, cellwidth = 3.5, cellheight = 2.5,
+         cluster_row = T,
+         cluster_cols = F,
+         show_rownames = T,
+         show_colnames = T,
+         fontsize_row = 2, 
+         fontsize_col = 4,
+         fontsize = 4)
+
+
+```
+
+
+
+```{r}
+ggsave("clr_bracken_d5_pr30.svg", xx, width = 3, height = 5)
+
+save_pheatmap_pdf(xx, "clr_bracken_d5_pr30.pdf")
+
+bracken_abs <- data.frame(count_mtrx)
+
+bracken_abs_animal <- data.frame(row.names(bracken_abs))
+bracken_abs_animal$Taurus <- rowSums(bracken_abs[1:3])
+bracken_abs_animal$Ovis <- rowSums(bracken_abs[4:13])
+
+Taurus <- as.character(subset(bracken_abs_animal, Taurus > 0, select = row.names.bracken_abs.)[,1])
+Ovis <- as.character(subset(bracken_abs_animal, Ovis > 200, select = row.names.bracken_abs.)[,1])
+
+input_1  <- list(Taurus = Taurus, Ovis = Ovis)
+
+```
+
+```{r}
+venn <- ggvenn(
+  input_1, 
+  fill_color = c("#8ECAE6", "#FFB703"), fill_alpha = 0.5,
+  stroke_size = 0.5, set_name_size = 6,text_size = 5
+  )
+venn
+
+ggsave("venn_all.svg", venn, width = 6, height = 5)
+
+
+```
+
+```{r}
+set.seed(20190708)
+genes <- paste("gene",1:1000,sep="")
+x <- list(
+  A = sample(genes,300), 
+  B = sample(genes,525), 
+  C = sample(genes,440),
+  D = sample(genes,350)
+  )
+ggvenn(
+  x, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+```
+
+
+
+
+
+```{r}
+reads <- read.csv(file = "reads_before_after.csv", row.names = 1)
+reads2 <- filter(reads, row_reads > 500000)
+class(reads2)
+reads_before <- cbind(data.frame(row.names(reads2)), data.frame(reads2$row_reads))
+reads_before$when <- "before"
+reads_before <- reads_before %>% 
+  rename(
+    row.names = row.names.reads2.,
+    row_reads = reads2.row_reads
+    )
+
+reads_trim <- cbind(data.frame(row.names(reads2)), data.frame(reads2$trimmed_reads))
+reads_trim$when <- "trim"
+reads_trim <- reads_trim %>% 
+  rename(
+    row.names = row.names.reads2.,
+    row_reads = reads2.trimmed_reads
+    )
+
+reads_after <- cbind(data.frame(row.names(reads2)), data.frame(reads2$bowtie2_after_reads))
+reads_after$when <- "after"
+reads_after <- reads_after %>% 
+  rename(
+    row.names = row.names.reads2.,
+    row_reads = reads2.bowtie2_after_reads
+    )
+
+
+reads_count <- rbind(reads_before, reads_trim, reads_after)
+
+data_new <- reads_count                             # Duplicate data
+
+data_new$when <- gsub("after", "После картирования", data_new$when)
+data_new$when <- factor(data_new$when,     # Reorder factor levels
+                          c("До обработки", "После фильтрации","После картирования"))
+
+df_mean <- data_new %>% 
+  group_by(when) %>% 
+  summarize(average = mean(row_reads)) %>%
+  ungroup()
+
+
+ggplot(data_new, aes(when, row_reads)) +
+geom_boxplot()+
+  
+# geom_point() is used to make points at data values
+geom_point(data = df_mean,
+             mapping = aes(x = when, y = average)) +
+geom_line(data = df_mean, 
+            mapping = aes(x = when, y = average, group=1)) +
+scale_y_continuous(trans='log10') +
+xlab("Этап обработки") + ylab("Количество прочтений")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
+```
+
+
+
+```{r}
+dist = phyloseq::distance(ps.rarefied, method="bray")
+ordination = ordinate(ps.rarefied, method="PCoA", distance=dist)
+plot_ordination(ps.rarefied, ordination, color="stage2") + 
+  theme_classic() +
+  theme(strip.background = element_blank())
+```
+
+
+```{r}
+ggsave("plot_ordination_CCA_all_С.png", plot_ordination_RDA, width = 8, height = 6) 
+ggsave("plot_corr.png", plot, width = 6, height = 5) 
+
+ggsave("plot_new.pdf", plot, width = 15, height = 15) 
+
+
+```
+
+
+
+```{r}
+t1 <- trans_abund$new(dataset = meco_dataset, taxrank = "Genus", ntaxa = 40)
+t1$plot_heatmap(facet = "Group", xtext_keep = FALSE, withmargin = FALSE)
+```
+
+
+
+
+#Kracken
+
+```{r}
+otu <- data.frame(read.csv(file = "nizh_sos_kar (1).csv", row.names = 1))
+otu[is.na(otu)] <- 0
+write.csv(otu, file = "kraken.otu.csv")
+
+
+otu <- otu_table(as.matrix(read.csv(file = "nizh_sos_kar (1).csv", row.names = 1)), taxa_are_rows = TRUE)
+tax <- tax_table(as.matrix(read.csv(file = "nizh_sos_class.csv", row.names = 1)))
+tax <- tax_table(cbind(tax[,"D"],tax[,"K"],tax[,"P"],tax[,"C"],tax[,"O"],tax[,"F"],tax[,"G"],tax[,"S"]))
+metadata <- sample_data(read.csv(file = 'krackn.meta.csv',
+                                        dec = ",",
+                                        header = TRUE,
+                                        row.names = 1 ))
+
+
+rownames(metadata) <- colnames(otu)
+
+
+```
+
+```{r}
+kracken <- phyloseq(otu, tax, sample_names(metadata))
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+df0 <- sample_names(kracken_ph)
+df1 <- sample_data(kracken_ph)
+df1$stage2 <- df1$stage
+
+
+df1$stage2[df1$stage2 == 1] <- "day 0"
+df1$stage2[df1$stage2 == 2] <- "day 04"
+df1$stage2[df1$stage2 == 3] <- "day 07"
+df1$stage2[df1$stage2 == 4] <- "day 11"
+df1$stage2[df1$stage2 == 5] <- "day 13"
+df1$stage2[df1$stage2 == 6] <- "day 18"
+df1$stage2[df1$stage2 == 7] <- "day 20"
+df1$stage2[df1$stage2 == 8] <- "day 22"
+df1$stage2[df1$stage2 == 9] <- "day 25"
+df1$stage2[df1$stage2 == 10] <- "day 25"
+df1$stage2[df1$stage2 == 11] <- "day 30"
+df1$stage2[df1$stage2 == 12] <- "day 32"
+df1$stage2[df1$stage2 == 13] <- "day 34"
+df1$stage2[df1$stage2 == 14] <- "day 37"
+
+df1$stage2 <- df1$stage
+df1$stage2 <- gsub("1", "day 0", df1$stage2)
+df1$stage2 <- gsub("2", "day 4", df1$stage2)
+df1$stage2 <- gsub("3", "day 7", df1$stage2)
+
+
+df1$stage2 <- gsub("4", "day 11", df1$stage2)
+df1$stage2 <- gsub("5", "day 13", df1$stage2)
+df1$stage2 <- gsub("6", "day 18", df1$stage2)
+
+df1$stage2 <- gsub("7", "day 20", df1$stage2)
+
+df1$stage2 <- gsub("8", "day 22", df1$stage2)
+df1$stage2 <- gsub("9", "day 25", df1$stage2)
+df1$stage2 <- gsub("10", "day 25", df1$stage2)
+
+df1$stage2 <- gsub("11", "day 30", df1$stage2)
+df1$stage2 <- gsub("12", "day 32", df1$stage2)
+df1$stage2 <- gsub("13", "day 34", df1$stage2)
+df1$stage2 <- gsub("14", "day 37", df1$stage2)
+
+
+df1$animaln <- df1$animal
+
+df1$animaln <- gsub("10", "contact", df1$animaln)
+df1$animaln <- gsub("8", "contact", df1$animaln)
+df1$animaln <- gsub("6", "contact", df1$animaln)
+df1$animaln <- gsub("4", "contact", df1$animaln)
+df1$animaln <- gsub("2", "contact", df1$animaln)
+
+df1$animaln <- gsub("1", "blood", df1$animaln)
+df1$animaln <- gsub("3", "blood", df1$animaln)
+df1$animaln <- gsub("5", "blood", df1$animaln)
+df1$animaln <- gsub("7", "blood", df1$animaln)
+df1$animaln <- gsub("9", "blood", df1$animaln)
+
+
+rownames(df3) <- df1
+
+meta1 <- sample_data(df1)
+kracken_ph1 = merge_phyloseq(kracken_ph, meta1)
+
+```
+
+
+
+
+```{r}
+otu <- otu_table(as.matrix(read.csv(file = "kraken_phylum.csv", row.names = 1)), taxa_are_rows = TRUE)
+otu[is.na(otu)] <- 0
+tax <- tax_table(as.matrix(read.csv(file = "kraken_tax_ph.csv", row.names = 1)))
+metadata <- sample_data(read.csv(file = 'krackn.meta.csv',
+                                        dec = ",",
+                                        header = TRUE,
+                                        row.names = 1 ))
+
+rownames(metadata) <- gsub(".report", "_kar_S", rownames(metadata))
+rownames(metadata) <- gsub("kraken_assigned_reads_ARRIAH_", "ARRIAH_", rownames(metadata))
+
+
+
+kracken_ph <- phyloseq(otu, tax, metadata)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# Выделение кластеров, изменение в количественной представленности по каждому из них
+
+Определение оптимального количества кластеров
+```{r}
+kracken_ph1
+object <- kracken_ph1 #which phyloseq to use
+transform <- "clr" #which transformation want to perform
+
+#Prepare data for further analysis
+count_mtrx <- pmerare_count_table(object, taxa_name_func) 
+ps2 <- microbiome::transform(count_mtrx, transform)
+
+set.seed(1)
+x<-rbind(matrix(rnorm(150,sd=0.3),ncol=3),
+matrix(rnorm(150,mean=3,sd=0.2),ncol=3),
+matrix(rnorm(150,mean=5,sd=0.3),ncol=3))
+
+diss_matrix<- dist(x, method = "euclidean", diag=FALSE)
+res<-NbClust(x, diss=diss_matrix, distance = NULL, min.nc=2, max.nc=6,
+             method = "ward.D", index = "ch")
+
+res <- NbClust(ps2, distance = "euclidean", min.nc = 2, max.nc = 15, method = "average")
+
+?NbClust
+res$All.index
+res$Best.nc
+res$Best.partition
+data<-iris[,-c(5)]
+diss_matrix<- dist(data, method = "euclidean", diag=FALSE)
+NbClust(data, diss=diss_matrix, distance = NULL, min.nc=2, max.nc=6,
+method = "ward.D2", index = "all")
+res$All.index
+
+
+diss_matrix<- dist(t(ps2), method = "euclidean", diag=FALSE)
+n <- as.matrix(vegdist(t(ps2)))
+bray_distance <- pheatmap(diss_matrix, cellwidth = 9, cellheight = 9, col = hcl.colors(50), fontsize_row = 8, fontsize_col = 8)
+ggsave("bray_distance2.pdf", bray_distance, width = 10, height = 10)
+
+#Count of clusters
+a <- NbClust(data = NULL, diss = n, distance = NULL,
+        min.nc = 2, max.nc = 10, method = "ward.D", index = "mcclain")
+
+?NbClust
+
+#Kmeans
+k_means_mat <- t(ps2) #transform
+k3 <- kmeans(k_means_mat, centers = 10, nstart = 1000)
+plot <- fviz_cluster(k3, data = k_means_mat, geom = c("point"), ggtheme = theme_minimal())
+plot
+
+ggsave("plot_clust.png", plot, width = 5, height = 4)
+```
+
+Определение отношения бактерии к каждому из кластеров
+```{r}
+
+```
+
+Определение суммы ридов бактерий по каждому из кластеров
+Логарифмирование количества
+```{r}
+
+```
+
+Отрисовка графика количества бактерий каждого из кластеров по каждому животному
+```{r}
+
+```
+
+## bacterias 
+
+```{r}
+bacs <- kracken_ph1 %>% subset_taxa(G == "Bacteroides" | G =="Porphyromonas" | G =="Fusobacterium" | G == "Haemophilus" | G =="Clostridioides" | G =="Campylobacter" | G == "Streptococcus")
+```
+
+
+```{r}
+bacs <- tax_glom(bacs, taxrank = "G")
+```
+
+```{r}
+otu_table(bacs)
+tax_table(bacs)
+```
+
+
+```{r}
+Flavobacterium <- kracken_ph1 %>% subset_taxa(G == "Flavobacterium")
+```
+
+```{r}
+Flavobacterium_m <- merge_samples(Flavobacterium, group = "stage2")
+?merge_samples
+sample_data(Flavobacterium)
+
+Flavobacterium_m <- tax_glom(Flavobacterium_m, "G")
+nn <- otu_table(Flavobacterium_m)
+nn <- log(nn)
+plot(nn)
+```
+
+
+## BETA DIVERSITY
+
+```{r}
+stages@sam_data$repl <- rownames(sample_data(stages))
+
+stages@sam_data$repl <- gsub("ARRIAH.16S_V4.*.repl1.*.fastq.gz","repl1",stages@sam_data$repl)
+
+stages@sam_data$animalandstage <- rownames(sample_data(stages))
+stages@sam_data$animalandstage <- gsub("ARRIAH.16S_V4.", "", gsub(".repl[1,2].R1.fastq.gz","", stages@sam_data$animalandstage))
+
+```
+
+```{r}
+bray_curtis_dist <- vegan::vegdist(t(microbiome::transform(stages@otu_table, "compositional")), method = "bray")
+```
+
+
+```{r}
+data(GlobalPatterns)
+?phyloseq::distance
+
+plotDistances = function(p = GlobalPatterns, m = "wunifrac", s = "X.SampleID", d = "SampleType") {
+
+  # calc distances
+  wu = phyloseq::distance(stages, method = "bray")
+  wu.m = melt(as.matrix(wu))
+  
+  # remove self-comparisons
+  wu.m = wu.m %>%
+    filter(as.character(Var1) != as.character(Var2)) %>%
+    mutate_if(is.factor,as.character)
+  
+  # get sample data (S4 error OK and expected)
+  sd = data.frame(sample_data(stages)) %>%
+    select("repl","animal", "stagen") %>%
+    mutate_if(is.factor,as.character)
+  
+  sd$Var1 <- rownames(sd)
+  # combined distances with sample data
+  colnames(sd) = c("Var1", "Type1")
+  ?left_join
+  wu.sd = dplyr::left_join(wu.m, sd, by = "Var1")
+  
+  colnames(sd) = c("repl", "animal", "Var2")
+  wu.sd = dplyr::left_join(wu.sd, sd, by = "Var2")
+  metric  repl.x
+  
+  # plot
+  ggplot(wu.sd, aes(x = stagen, y = value)) +
+    theme_bw() +
+    geom_boxplot() +
+    scale_color_identity() +
+    theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5)) + 
+    ggtitle(paste0("Distance Metric = ", "Bray-Kurtis"))
+}
+
+plotDistances()
+```
+
+Реплики и животные
+```{r}
+sapply(wu.m, function(x) wu.m$Var1[])
+
+wu.m[] <- lapply(wu.m, as.character)
+metadata <- stages@sam_data
+metadata$Var1 <- rownames(metadata)
+colnames(metadata)[7] <- "Var1"
+
+wu.nn <- dplyr::left_join(wu.nn, metadata, by = "Var1")
+
+repl_dist <- wu.nn[wu.nn$animalandstage.x==wu.nn$animalandstage.y & wu.nn$repl.x!=wu.nn$repl.y,]
+
+
+animal_dist <- wu.nn[wu.nn$animal.x != wu.nn$animal.y,]
+
+mylist <- list()
+for (x in unique(animal_dist$animal.x)) {
+  vec <- list()
+  for (y in unique(animal_dist$animal.y)) {
+    vec[[y]] <- mean(as.numeric(animal_dist[animal_dist$animal.x == x & animal_dist$animal.y == y, "value"]))
+  }
+  mylist[[x]] <- unlist(vec)
+}
+
+mylist <- unlist(mylist)
+mylist <- matrix(mylist, 10)
+animal_dist <- melt(mylist)
+
+
+```
+
+Стадии
+```{r}
+stage_dist <- wu.nn[wu.nn$stage.x != wu.nn$stage.y,]
+
+mylist <- list()
+for (x in unique(stage_dist$stage.x)) {
+  vec <- list()
+  for (y in unique(stage_dist$stage.y)) {
+    vec[[y]] <- mean(as.numeric(stage_dist[stage_dist$stage.x == x & stage_dist$stage.y == y, "value"]))
+  }
+  mylist[[x]] <- unlist(vec)
+}
+
+mylist <- unlist(mylist)
+mylist <- matrix(mylist, 10)
+stage_dist <- melt(mylist)
+```
+
+```{r}
+stage_dist <- subset(stage_dist, !is.nan(stage_dist$value))
+stage_dist$ani <- lapply(rownames(stage_dist), function(x) paste0(sort(c(stage_dist[x,1], stage_dist[x,2]))))
+stage_dist$ani <- sapply(stage_dist$ani, paste, collapse="")
+
+stage_dist <- stage_dist[!duplicated(stage_dist$ani), ]
+stage_dist$type <- "Stage distance"
+stage_dist <- select(stage_dist, value, type)
+
+```
+
+```{r}
+animal_dist <- subset(animal_dist, !is.nan(animal_dist$value))
+animal_dist$ani <- lapply(rownames(animal_dist), function(x) paste0(sort(c(animal_dist[x,1], animal_dist[x,2]))))
+animal_dist$ani <- sapply(animal_dist$ani, paste, collapse="")
+
+animal_dist <- animal_dist[!duplicated(animal_dist$ani), ]
+animal_dist$type <- "Animal distance"
+animal_dist <- select(animal_dist, value, type)
+```
+
+```{r}
+repl_dist <- repl_dist[!duplicated(repl_dist$value),]
+repl_dist$type <- "Replica distance"
+repl_dist <- select(repl_dist, value, type)
+distances <- rbind(animal_dist, stage_dist, repl_dist)
+```
+
+
+```{r}
+?as.numeric
+distances$value1 <- as.numeric(distances$value)
+ggboxplot(distances, x = "type", y = "value1",
+          color = "type",legend = "none",
+          add = "jitter") + 
+  geom_hline(yintercept = mean(distances$value1), linetype = 2)+ # Add horizontal line at base mean
+  stat_compare_means(method = "anova", label.y = 1.05)+        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE) + 
+  xlab("type") + ylab("Distance") +
+  theme(axis.title = element_text(size = 20))
+```
+
+
+#metaphlan
+
+```{r}
+phlan_vniizgh <- read.table("metaphlan/merged_tables.txt",sep="\t",header=T)
+row.names(phlan_vniizgh) <- phlan_vniizgh$clade_name
+phlan_vniizgh <- dplyr::select(phlan_vniizgh, -clade_name)
+colSums(phlan_vniizgh)
+
+
+phlan_vniizgh <- 
+
+```
+
+

@@ -1,0 +1,188 @@
+
+```{r}
+levels  <- c("Phylum", "Class", "Order" ,"Family", "Genus", "Specie")
+```
+
+
+```{r}
+setwd("/Users/aleksandrakozlova/Desktop/Work/Kurchatnik/Projects/vniizg/work_process/metaphlan/")
+
+# taking data table with abundance of taxas (metaphlan)
+zg_metaphlnan <- read.table("metaphlan/merged_tables.txt", sep="\t",header=T)
+
+# taking sample names 
+samp_names <- colnames(select(zg_metaphlnan, -clade_name))
+```
+
+
+#Preprocessing data
+
+```{r}
+# taxonomic levels names vector
+levels <- c("phylum", "class", "order" ,"family" ,"genus" ,"specie", "t")
+
+# counting names for every taxonomic level
+level_names <- sapply(1:(length(levels)-1), function(x)
+  gsub(paste0(".*",substr(levels[x],1,1),"__"), "",
+                                    gsub(paste0("\\|",substr(levels[x+1],1,1),"__.*"), "",
+                                         zg_metaphlnan$clade_name)))
+
+# adding names to the table
+colnames(level_names) <- levels[1:6]
+zg_metaphlnan <- cbind(level_names, zg_metaphlnan)
+
+# adding data for strain
+zg_metaphlnan$t <- gsub(paste0(".*",levels[7],"__"), "", zg_metaphlnan$clade_name)
+```
+
+
+count abundance of every class and delete intermidiate classes 
+```{r}
+# function for counting abundance table for every taxonomy level with unclussified bacteria
+count_tables <- function(data, level_id) {
+  data <- data.frame(data)
+  take_needed <- data[!rownames(data) %in% grep("k__*",data[,levels[level_id]]) & rownames(data) %in% grep("k__*",data[,levels[level_id+1]]),]
+  take_needed <- data.table(take_needed[,colnames(take_needed) %in% samp_names | 
+                                       colnames(take_needed) == levels[level_id]])
+  take_needed[ , lapply(.SD, sum), by = eval(levels[level_id])]
+  take_needed <- data.frame(take_needed)
+  rownames(take_needed) <- take_needed[,levels[level_id]]
+  take_needed <- select(take_needed, -(levels[level_id]))
+  # take_needed["uncl",] <- 100-colSums(take_needed)
+  return(take_needed)
+}
+
+# using function for counting abundance
+metap_data <- lapply(1:(length(levels)-1), function(x) count_tables(zg_metaphlnan, x))
+
+# taking samples, where unclassified reads present less than 80% of all data
+#metap_data_less_uncl <- sapply(1:length(metap_data), function(n) metap_data[[n]][,metap_data[[n]]["uncl",] < 90])
+#dim(metap_data_less_uncl[[6]])
+dim(metap_data[[6]])
+```
+
+making metadata for metaphlan data
+```{r}
+metadata_metaphlan <- data.frame(cbind(colnames(metap_data[[6]]), colnames(metap_data[[6]])))
+colnames(metadata_metaphlan) <- c("sam_names", "stage")
+metadata_metaphlan$stage <- gsub("_S.*","", (gsub("ARRIAH_", "", metadata_metaphlan$stage)))
+
+substrRight <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+
+metadata_metaphlan$animal <- sapply(metadata_metaphlan$stage, function(x) substrRight(x, 1))
+metadata_metaphlan$animal <- gsub("^", "cow ", metadata_metaphlan$animal)
+
+metadata_metaphlan$stage <- sapply(as.integer(metadata_metaphlan$stage), function(x) floor((x-1)/10)+1)
+metadata_metaphlan$stage_n <- gsub("^", "stage ", metadata_metaphlan$stage)
+
+metadata_metaphlan$color <- metadata_metaphlan$stage
+colors <- c("#F94144", "#F3722C", "#F8961E", "#F9844A", "#F9C74F", "#90BE6D", 
+                    "#43AA8B", "#4D908E", "#577590", "#277DA1", "#80538A", 
+                    "#BF709F" ,"#E7A5B0", "#B4BF6D")
+                    
+metadata_metaphlan$color <- sapply(metadata_metaphlan$color, function(x) colors[x])
+
+write.csv(metadata_metaphlan, "metadata_metaphlan.csv")
+```
+
+lead to 100% without unclassified
+```{r}
+# To 100% (add data without unclassified)
+del_uncl <- function(data) {
+  lapply(1:length(data), function(lev) {
+    data <- data[[lev]]
+    data_l <- data.frame(apply(data, 2, function(x) x/sum(x)*100))
+    return(data_l)
+  })
+}
+
+test <- del_uncl(metap_data)
+
+```
+
+
+add clr normalisation to data
+```{r}
+clr_data <- lapply(1:length(test), function(lev) clr(test[[lev]]))
+names(clr_data) <- levels
+```
+
+```{r}
+data <- clr_data[[6]]
+metadata_metaphlan
+metadata_metaphlan$color <- 
+distance <- "euclidean"
+```
+
+```{r}
+color <- metadata_metaphlan$color
+dist_f <- function(data, distance){
+  dist <- vegdist(t(data), method = distance)
+  
+  pcoaVS <- pco(dist, negvals = "zero", dround = 0)
+  
+  plot(pcoaVS$vectors[,1], pcoaVS$vectors[,2], )
+  legend("bottomright", legend = paste("Group", ), col = )
+  
+  # plot(pcoaVS$vectors[,1], pcoaVS$vectors[,2], xlab = "PCoA1", ylab = "PCoA2", 
+  #      axes = TRUE, main = "PCoA (ecodist) on varespec data")
+  # text(pcoaVS$vectors[,1], pcoaVS$vectors[,2], cex = 0.9, xpd = TRUE)
+  # 
+}
+?plot
+rownames(pcoaVS$vectors)
+lapply(levels, function(lev) dist_f(clr_data[[lev]], distance = "euclidean"))
+
+
+```
+
+
+
+```{r}
+save_pheatmap_pdf <- function(x, filename, width, height) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+```
+
+
+```{r}
+xx <- pheatmap(clr_data[[1]], cellwidth = 2, cellheight = 2.5,
+         show_rownames = T,
+         show_colnames = T,
+         fontsize_row = 2, 
+         fontsize_col = 2,
+         fontsize = 2,
+         cluster_cols = F,
+         annotation_col = metadata_metaphlan,  
+         cluster_rows = F)
+```
+
+```{r}
+save_pheatmap_pdf(xx, "metap_genus_clr.pdf", 6,10)
+```
+
+
+clasterization analysis
+```{r}
+pseudo_count_clr <- lapply(levels, function(lev) 
+  sapply(clr_data[[lev]], function(x) 
+    if (x==0) {x = x+0.0000001} 
+    else {x = x}
+    ))
+pseudo_count_clr[[6]] <- matrix(pseudo_count_clr[[6]], len)
+
+sapply(1:length(cle_data), dunction(lev) {
+  
+})
+
+clr_data[[6]]
+cluster_results <- NbClust(as.matrix(pseudo_count_clr[[6]]), distance = "euclidean", max.nc = 12, method = "kmeans")
+```
+
